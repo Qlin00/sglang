@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.elastic_vram import ElasticLayoutStage
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -42,13 +43,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        elastic_vram_coordinator=None,
     ):
         self.size = size
+        self.max_size = getattr(kvcache, "max_size", size)
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
         self._kvcache = kvcache
         self.need_sort = need_sort
+        self.elastic_vram_coordinator = elastic_vram_coordinator
 
         self.free_pages = None
         self.release_pages = None
@@ -101,6 +105,66 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def _sync_capacity_from_kvcache(self, old_size: int):
+        raise NotImplementedError()
+
+    def _grow_pool(self, extra_tokens: int, stage: ElasticLayoutStage) -> bool:
+        if self.elastic_vram_coordinator is None:
+            return False
+        if not hasattr(self._kvcache, "capacity_bytes"):
+            return False
+        target_tokens = min(self.max_size, self.size + extra_tokens)
+        if target_tokens <= self.size:
+            return False
+        current_bytes = self._kvcache.capacity_bytes()
+        per_token_bytes = current_bytes / max(self.size, 1)
+        target_capacity_bytes = int(per_token_bytes * target_tokens)
+        old_size = self.size
+        ok = self.elastic_vram_coordinator.request_kv_growth(
+            self._kvcache,
+            target_capacity_bytes,
+            stage,
+        )
+        new_size = getattr(self._kvcache, "size", old_size)
+        if ok and new_size > old_size:
+            self._sync_capacity_from_kvcache(old_size)
+            return True
+        return False
+
+    def _merged_free_pages(self):
+        if len(self.release_pages) == 0:
+            return self.free_pages
+        return torch.cat((self.free_pages, self.release_pages))
+
+    def _tail_shrink_target_size(self) -> int | None:
+        merged = self._merged_free_pages()
+        if merged.numel() == 0:
+            return None
+        merged, _ = torch.sort(merged)
+        tail = 0
+        current_last = self.size // self.page_size
+        while tail < merged.numel() and int(merged[-1 - tail].item()) == current_last - tail:
+            tail += 1
+        if tail == 0:
+            return None
+        return max(self.page_size, (current_last - tail) * self.page_size)
+
+    def on_request_finished(self) -> None:
+        if self.elastic_vram_coordinator is None:
+            return
+        target_size = self._tail_shrink_target_size()
+        if target_size is None or target_size >= self.size:
+            self.elastic_vram_coordinator.rebalance_experts(ElasticLayoutStage.REQUEST_FINISHED)
+            return
+        current_bytes = self._kvcache.capacity_bytes()
+        per_token_bytes = current_bytes / max(self.size, 1)
+        target_capacity_bytes = int(per_token_bytes * target_size)
+        self.elastic_vram_coordinator.notify_kv_released(
+            self._kvcache,
+            target_capacity_bytes,
+        )
+        self._sync_capacity_from_kvcache(self.size)
+
     @abc.abstractmethod
     def clear(self):
         raise NotImplementedError()
@@ -124,8 +188,17 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        elastic_vram_coordinator=None,
     ):
-        super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        super().__init__(
+            size,
+            1,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+            elastic_vram_coordinator=elastic_vram_coordinator,
+        )
         self.clear()
 
     def clear(self):
@@ -144,6 +217,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
+
+        if need_size > len(self.free_pages):
+            self._grow_pool(max(need_size - len(self.free_pages), 1), ElasticLayoutStage.PREFILL)
 
         if need_size > len(self.free_pages):
             return None
@@ -169,6 +245,18 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def _sync_capacity_from_kvcache(self, old_size: int):
+        new_size = getattr(self._kvcache, "size", old_size)
+        if new_size == old_size:
+            return
+        if new_size > old_size:
+            new_slots = torch.arange(old_size + 1, new_size + 1, dtype=torch.int64, device=self.device)
+            self.free_pages = torch.cat((self.free_pages, new_slots))
+        else:
+            self.free_pages = self.free_pages[self.free_pages <= new_size]
+            self.release_pages = self.release_pages[self.release_pages <= new_size]
+        self.size = new_size
 
 
 def alloc_extend_naive(
@@ -365,8 +453,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        elastic_vram_coordinator=None,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+            elastic_vram_coordinator=elastic_vram_coordinator,
+        )
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
@@ -382,6 +479,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_pages = need_size // self.page_size
         if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
+        if num_pages > len(self.free_pages):
+            self._grow_pool(max((num_pages - len(self.free_pages)) * self.page_size, self.page_size), ElasticLayoutStage.PREFILL)
         if num_pages > len(self.free_pages):
             return None
 
@@ -415,10 +514,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
         bs = len(prefix_lens)
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
             self.merge_and_sort_free()
+        if num_new_pages > len(self.free_pages):
+            self._grow_pool(max((num_new_pages - len(self.free_pages)) * self.page_size, self.page_size), ElasticLayoutStage.PREFILL)
 
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
@@ -449,11 +555,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -472,8 +573,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
+        if num_new_pages > len(self.free_pages):
+            self._grow_pool(max((num_new_pages - len(self.free_pages)) * self.page_size, self.page_size), ElasticLayoutStage.BATCH_BOUNDARY)
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
@@ -488,11 +596,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -529,3 +632,29 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def _sync_capacity_from_kvcache(self, old_size: int):
+        new_size = getattr(self._kvcache, "size", old_size)
+        old_pages = old_size // self.page_size
+        new_pages = new_size // self.page_size
+        if new_pages > old_pages:
+            appended = torch.arange(old_pages + 1, new_pages + 1, dtype=torch.int64, device=self.device)
+            self.free_pages = torch.cat((self.free_pages, appended))
+        elif new_pages < old_pages:
+            self.free_pages = self.free_pages[self.free_pages <= new_pages]
+            self.release_pages = self.release_pages[self.release_pages <= new_pages]
+        self.size = new_size
+        self.num_pages = new_pages
+
+    def _tail_shrink_target_size(self) -> int | None:
+        merged = self._merged_free_pages()
+        if merged.numel() == 0:
+            return None
+        merged, _ = torch.sort(merged)
+        tail = 0
+        current_last = self.num_pages
+        while tail < merged.numel() and int(merged[-1 - tail].item()) == current_last - tail:
+            tail += 1
+        if tail == 0:
+            return None
+        return max(self.page_size, (current_last - tail) * self.page_size)

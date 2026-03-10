@@ -506,6 +506,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
+    if hasattr(tree_cache.token_to_kv_pool_allocator, "on_request_finished"):
+        tree_cache.token_to_kv_pool_allocator.on_request_finished()
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

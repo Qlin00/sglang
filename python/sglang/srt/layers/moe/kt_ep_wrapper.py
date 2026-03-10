@@ -10,9 +10,11 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 import copy
 import ctypes
 import logging
+import math
 import os
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -27,6 +29,12 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.mem_cache.elastic_vram import (
+    ElasticLayoutStage,
+    ElasticVramCoordinator,
+    get_or_create_unified_gpu_pool,
+)
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
@@ -1983,7 +1991,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method = gpu_method
         self.kt_config = kt_config
         self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
-        self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
+        self.resident_slot_count = int(self.gpu_experts_mask.sum().item())
+        self.num_gpu_experts = self.resident_slot_count
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -1991,13 +2000,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Mapping tables for non-contiguous GPU expert allocation (CPU tensors)
         # Used by weight_loader to remap expert_id when loading weights
         gpu_expert_indices = torch.where(self.gpu_experts_mask)[0]
-        self.logical_to_gpu_index = torch.full(
+        self.logical_expert_to_slot = torch.full(
             (len(self.gpu_experts_mask),), -1, dtype=torch.int32
         )
-        self.logical_to_gpu_index[gpu_expert_indices] = torch.arange(
+        self.logical_expert_to_slot[gpu_expert_indices] = torch.arange(
             len(gpu_expert_indices), dtype=torch.int32
         )
-        self.gpu_index_to_logical = gpu_expert_indices.to(torch.int32)
+        self.slot_to_logical_expert = gpu_expert_indices.to(torch.int32)
+        self.logical_to_gpu_index = self.logical_expert_to_slot
+        self.gpu_index_to_logical = self.slot_to_logical_expert
 
         # CUDA tensors for inference (will be set in create_weights)
         self.gpu_experts_mask_cuda = None
@@ -2006,6 +2017,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
+        self._layer_ref = None
+        self.unified_gpu_pool = None
+        self.elastic_vram_coordinator: Optional[ElasticVramCoordinator] = None
+        self.resident_weight_handles: Dict[str, object] = {}
+        self.resident_capacity_bytes = 0
+        self.resident_slots = list(range(self.resident_slot_count))
+        self.resident_priority = -self.kt_config.layer_idx
+        self.logical_expert_last_access = None
+        self._resident_cpu_buffers: Dict[str, torch.Tensor] = {}
+        self._resident_shm_handles: Dict[str, shared_memory.SharedMemory] = {}
+        self._resident_all_rank_buffer_ptrs: Dict[str, List[int]] = {}
+        self._resident_opened_shm_refs: Dict[str, shared_memory.SharedMemory] = {}
+        self._resident_shm_unique_id: Optional[str] = None
+        self._resident_weights_materialized = False
 
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
@@ -2015,6 +2040,304 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+
+    def attach_elastic_vram_coordinator(
+        self, coordinator: ElasticVramCoordinator
+    ) -> None:
+        self.elastic_vram_coordinator = coordinator
+        coordinator.register_expert_manager(self)
+        self._maybe_materialize_resident_weights()
+
+    def _require_layer(self) -> torch.nn.Module:
+        assert self._layer_ref is not None, "Layer reference is not initialized"
+        layer = self._layer_ref()
+        assert layer is not None, "Layer reference is no longer valid"
+        return layer
+
+    def _slot_tensor_names(self, layer: torch.nn.Module) -> list[str]:
+        if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
+            return []
+        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            return self.WEIGHT_NAMES_FP8
+        if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            return self.WEIGHT_NAMES_FP8_CHANNEL
+        if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+            return self.WEIGHT_NAMES_BF16
+        return []
+
+    def _estimate_slot_bytes(self, layer: torch.nn.Module) -> int:
+        names = self._slot_tensor_names(layer)
+        if not names or self.resident_slot_count == 0:
+            return 0
+        total = 0
+        for name in names:
+            tensor = getattr(layer, name)
+            total += tensor[0].nbytes
+        return int(total)
+
+    def estimate_resident_capacity_bytes(self) -> int:
+        if self._layer_ref is None:
+            return 0
+        layer = self._layer_ref()
+        if layer is None:
+            return 0
+        return self._estimate_slot_bytes(layer) * self.resident_slot_count
+
+    def _maybe_materialize_resident_weights(self) -> bool:
+        if self._resident_weights_materialized:
+            return False
+        if self.unified_gpu_pool is None or not self.unified_gpu_pool.is_bootstrapped():
+            return False
+        if self._layer_ref is None:
+            return False
+        layer = self._layer_ref()
+        if layer is None:
+            return False
+        self._bind_slot_tensors_to_pool(layer)
+        self._init_resident_loader_buffers(layer)
+        self._resident_weights_materialized = True
+        return True
+
+    def _bind_slot_tensors_to_pool(self, layer: torch.nn.Module) -> None:
+        names = self._slot_tensor_names(layer)
+        if not names:
+            return
+        if self.unified_gpu_pool is None:
+            self.unified_gpu_pool = get_or_create_unified_gpu_pool(
+                next(layer.parameters()).device
+            )
+        old_handles = list(self.resident_weight_handles.values())
+        self.resident_weight_handles = {}
+        self.resident_capacity_bytes = 0
+        for name in names:
+            tensor = getattr(layer, name)
+            handle = self.unified_gpu_pool.alloc(int(tensor.nbytes), tag=f"expert:{self.kt_config.layer_idx}:{name}")
+            view = self.unified_gpu_pool.tensor_view(handle, tensor.dtype, tuple(tensor.shape))
+            view.copy_(tensor)
+            replace_parameter(layer, name, view)
+            self.resident_weight_handles[name] = handle
+            self.resident_capacity_bytes += handle.nbytes
+        for handle in old_handles:
+            self.unified_gpu_pool.free(handle)
+
+    def _init_resident_loader_buffers(self, layer: torch.nn.Module) -> None:
+        names = self._slot_tensor_names(layer)
+        if not names or self._resident_cpu_buffers:
+            return
+
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            self._resident_shm_unique_id = uuid.uuid4().hex[:8]
+        else:
+            self._resident_shm_unique_id = None
+        if dist.is_initialized():
+            holder = [self._resident_shm_unique_id]
+            dist.broadcast_object_list(holder, src=0, group=get_tp_group().cpu_group)
+            self._resident_shm_unique_id = holder[0]
+
+        for name in names:
+            gpu_tensor = getattr(layer, name)
+            expert_shape = gpu_tensor.shape[1:]
+            expert_nbytes = int(gpu_tensor[0].nbytes)
+            shm_name = f"kt_resident_{self.kt_config.layer_idx}_{name}_r{tp_rank}_{self._resident_shm_unique_id}"
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=expert_nbytes * 2)
+            self._resident_shm_handles[name] = shm
+            cpu_buffer = torch.frombuffer(shm.buf, dtype=gpu_tensor.dtype).reshape((2,) + tuple(expert_shape))
+            if torch.cuda.is_available():
+                torch.cuda.cudart().cudaHostRegister(cpu_buffer.data_ptr(), expert_nbytes * 2, 0)
+            self._resident_cpu_buffers[name] = cpu_buffer
+
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+
+        buffer_ptrs = {name: [] for name in names}
+        tp_world_size = get_tensor_model_parallel_world_size()
+        for rank in range(tp_world_size):
+            for name in names:
+                if rank == tp_rank:
+                    ptr = self._resident_cpu_buffers[name].data_ptr()
+                elif tp_rank == 0:
+                    shm_name = f"kt_resident_{self.kt_config.layer_idx}_{name}_r{rank}_{self._resident_shm_unique_id}"
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    self._resident_opened_shm_refs[f"{name}_r{rank}"] = shm
+                    ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                else:
+                    ptr = 0
+                buffer_ptrs[name].append(ptr)
+        self._resident_all_rank_buffer_ptrs = buffer_ptrs
+
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+        for shm in self._resident_shm_handles.values():
+            shm.unlink()
+
+    def _submit_single_expert_to_buffers(self, logical_expert_id: int, slot: int = 0) -> None:
+        if self.tp_rank != 0 or self.wrapper is None:
+            return
+        layer = self._require_layer()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        def ptrs(name: str) -> list[int]:
+            buf = self._resident_cpu_buffers[name]
+            expert_nbytes = int(buf[0].nbytes)
+            return [ptr + slot * expert_nbytes for ptr in self._resident_all_rank_buffer_ptrs[name]]
+
+        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            self.wrapper.submit_write_weight_scale_to_buffer(
+                tp_world_size,
+                logical_expert_id,
+                ptrs("w13_weight"),
+                ptrs("w13_weight_scale_inv"),
+                ptrs("w2_weight"),
+                ptrs("w2_weight_scale_inv"),
+            )
+        elif hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            self.wrapper.submit_write_weight_scale_to_buffer(
+                tp_world_size,
+                logical_expert_id,
+                ptrs("w13_weight"),
+                ptrs("w13_weight_scale"),
+                ptrs("w2_weight"),
+                ptrs("w2_weight_scale"),
+            )
+        else:
+            self.wrapper.submit_write_weight_scale_to_buffer(
+                tp_world_size,
+                logical_expert_id,
+                ptrs("w13_weight"),
+                [0] * tp_world_size,
+                ptrs("w2_weight"),
+                [0] * tp_world_size,
+            )
+        self.wrapper.sync_write_weight_scale_to_buffer()
+
+    def _rebuild_resident_slots(self, selected_logical_ids: list[int]) -> int:
+        layer = self._require_layer()
+        names = self._slot_tensor_names(layer)
+        if not names or self.unified_gpu_pool is None:
+            return 0
+
+        selected_logical_ids = sorted(dict.fromkeys(int(x) for x in selected_logical_ids))
+        if not selected_logical_ids:
+            return 0
+
+        old_handles = self.resident_weight_handles
+        old_total_bytes = self.resident_capacity_bytes
+        old_mapping = self.logical_expert_to_slot.clone()
+        old_tensors = {name: getattr(layer, name) for name in names}
+
+        new_tensors = {}
+        new_handles = {}
+        new_total_bytes = 0
+        new_slot_count = len(selected_logical_ids)
+
+        for name in names:
+            old_tensor = old_tensors[name]
+            new_shape = (new_slot_count,) + tuple(old_tensor.shape[1:])
+            handle = self.unified_gpu_pool.alloc(
+                int(math.prod(new_shape) * old_tensor.element_size()),
+                tag=f"expert:{self.kt_config.layer_idx}:{name}",
+            )
+            view = self.unified_gpu_pool.tensor_view(handle, old_tensor.dtype, new_shape)
+            new_tensors[name] = view
+            new_handles[name] = handle
+            new_total_bytes += handle.nbytes
+
+        for dst_slot, logical_id in enumerate(selected_logical_ids):
+            old_slot = int(old_mapping[logical_id].item())
+            if old_slot >= 0:
+                for name in names:
+                    new_tensors[name][dst_slot].copy_(old_tensors[name][old_slot], non_blocking=False)
+                continue
+            if self.tp_rank == 0 and self.wrapper is not None:
+                self._submit_single_expert_to_buffers(logical_id, slot=0)
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+            for name in names:
+                new_tensors[name][dst_slot].copy_(self._resident_cpu_buffers[name][0], non_blocking=False)
+
+        for name in names:
+            replace_parameter(layer, name, new_tensors[name])
+        for handle in old_handles.values():
+            self.unified_gpu_pool.free(handle)
+
+        self.resident_weight_handles = new_handles
+        self.resident_capacity_bytes = new_total_bytes
+        self.resident_slot_count = new_slot_count
+        self.num_gpu_experts = new_slot_count
+        self.resident_slots = list(range(new_slot_count))
+        self.gpu_method.num_gpu_experts = new_slot_count
+
+        gpu_experts_mask_cpu, logical_to_gpu_index_cuda, gpu_index_to_logical_cpu = update_gpu_expert_mappings(
+            selected_experts=torch.tensor(selected_logical_ids, dtype=torch.int64, device=layer.w13_weight.device if hasattr(layer, "w13_weight") else layer.w13_weight_scale.device),
+            num_experts=self.global_num_experts,
+            device=next(layer.parameters()).device,
+        )
+        self.gpu_experts_mask = gpu_experts_mask_cpu
+        self.logical_expert_to_slot = logical_to_gpu_index_cuda.cpu()
+        self.slot_to_logical_expert = gpu_index_to_logical_cpu
+        self.logical_to_gpu_index = self.logical_expert_to_slot
+        self.gpu_index_to_logical = self.slot_to_logical_expert
+        if self.gpu_experts_mask_cuda is not None:
+            self.gpu_experts_mask_cuda.copy_(gpu_experts_mask_cpu)
+        if self.logical_to_gpu_index_cuda is not None:
+            self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cuda)
+        if self.tp_rank == 0:
+            update_kt_wrapper_masks(self.wrapper, gpu_experts_mask_cpu)
+        if hasattr(self, "moe_runner_config"):
+            self.create_moe_runner(layer, self.moe_runner_config)
+        return new_total_bytes - old_total_bytes
+
+    def _record_expert_usage(self, topk_ids: torch.Tensor) -> None:
+        if self.logical_expert_last_access is None:
+            return
+        now = int(time.monotonic_ns())
+        logical_ids = torch.unique(topk_ids.detach().cpu())
+        self.logical_expert_last_access[logical_ids] = now
+
+    def evict_cold_experts(self, bytes_needed: int, stage: ElasticLayoutStage) -> int:
+        if stage not in (
+            ElasticLayoutStage.PREFILL,
+            ElasticLayoutStage.BATCH_BOUNDARY,
+            ElasticLayoutStage.REQUEST_FINISHED,
+        ):
+            return 0
+        layer = self._require_layer()
+        slot_bytes = self._estimate_slot_bytes(layer)
+        if slot_bytes <= 0 or self.resident_slot_count <= 1:
+            return 0
+        slots_to_remove = min(
+            self.resident_slot_count - 1,
+            math.ceil(bytes_needed / slot_bytes),
+        )
+        if slots_to_remove <= 0:
+            return 0
+        resident = self.slot_to_logical_expert.tolist()
+        resident.sort(key=lambda idx: int(self.logical_expert_last_access[idx].item()), reverse=True)
+        delta = self._rebuild_resident_slots(resident[:-slots_to_remove])
+        return max(0, -delta)
+
+    def grow_hot_experts(self, available_bytes: int, stage: ElasticLayoutStage) -> int:
+        if stage not in (
+            ElasticLayoutStage.BATCH_BOUNDARY,
+            ElasticLayoutStage.REQUEST_FINISHED,
+        ):
+            return 0
+        layer = self._require_layer()
+        slot_bytes = self._estimate_slot_bytes(layer)
+        if slot_bytes <= 0 or available_bytes < slot_bytes:
+            return 0
+        current = set(self.slot_to_logical_expert.tolist())
+        candidates = [
+            idx
+            for idx in torch.argsort(self.logical_expert_last_access, descending=True).tolist()
+            if idx not in current and int(self.logical_expert_last_access[idx].item()) > 0
+        ]
+        slots_to_add = min(len(candidates), available_bytes // slot_bytes)
+        if slots_to_add <= 0:
+            return 0
+        delta = self._rebuild_resident_slots(list(current) + candidates[:slots_to_add])
+        return max(0, delta)
 
     def create_weights(
         self,
@@ -2036,6 +2359,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
+        self.logical_expert_last_access = torch.zeros(num_experts, dtype=torch.int64)
+        self._layer_ref = weakref.ref(layer)
         self._full_init_args = (
             hidden_size,
             intermediate_size_per_partition,
@@ -2073,6 +2398,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
+        self.unified_gpu_pool = get_or_create_unified_gpu_pool(target_device)
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
 
@@ -2141,6 +2467,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+
+        self._maybe_materialize_resident_weights()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -2302,6 +2630,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        self._record_expert_usage(topk_output.topk_ids)
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
 
         # Check for full GPU fallback
@@ -2477,8 +2806,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_experts_mask = gpu_experts_mask_cpu  # CPU tensor, safe to replace
         self.gpu_experts_mask_cuda.copy_(gpu_experts_mask_cpu)  # In-place update for CUDA graph
         self.logical_to_gpu_index = logical_to_gpu_index_cuda.cpu()  # CPU version for weight loading
+        self.logical_expert_to_slot = self.logical_to_gpu_index
         self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cuda)  # In-place update for CUDA graph
         self.gpu_index_to_logical = gpu_index_to_logical_cpu  # CPU tensor, safe to replace
+        self.slot_to_logical_expert = self.gpu_index_to_logical
+        self.resident_slot_count = self.num_gpu_experts
+        self.resident_slots = list(range(self.resident_slot_count))
 
         # Step 4: Update KT wrapper (rank 0 only)
         if self.tp_rank == 0:
@@ -2531,3 +2864,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+
+
+
+
+

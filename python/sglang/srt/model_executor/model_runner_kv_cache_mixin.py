@@ -12,10 +12,16 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.elastic_vram import (
+    get_or_create_elastic_vram_coordinator,
+    get_or_create_unified_gpu_pool,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
+    ElasticMLATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    ElasticMHATokenToKVPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
@@ -29,6 +35,7 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_npu,
 )
+from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -336,9 +343,59 @@ class ModelRunnerKVCacheMixin:
             f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
         )
 
+    def _should_enable_elastic_vram(self: ModelRunner) -> bool:
+        return bool(
+            self.device == "cuda"
+            and self.server_args.kt_weight_path is not None
+            and (
+                not self.use_mla_backend
+                or not is_deepseek_nsa(self.model_config.hf_config)
+            )
+            and not self.server_args.enable_double_sparsity
+            and not self.is_hybrid_swa
+            and self.mambaish_config is None
+            and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+        )
+
+    def _register_elastic_expert_managers(self: ModelRunner) -> None:
+        if self.elastic_vram_coordinator is None:
+            return
+        seen = set()
+        for module in self.model.modules():
+            method = getattr(module, "quant_method", None)
+            if method is None and hasattr(module, "scheme"):
+                method = module.scheme
+            if method is None:
+                continue
+            if not hasattr(method, "attach_elastic_vram_coordinator"):
+                continue
+            if id(method) in seen:
+                continue
+            seen.add(id(method))
+            method.attach_elastic_vram_coordinator(self.elastic_vram_coordinator)
+
+    def _estimate_elastic_expert_bytes(self: ModelRunner) -> int:
+        total = 0
+        seen = set()
+        for module in self.model.modules():
+            method = getattr(module, "quant_method", None)
+            if method is None and hasattr(module, "scheme"):
+                method = module.scheme
+            if method is None:
+                continue
+            if not hasattr(method, "estimate_resident_capacity_bytes"):
+                continue
+            if id(method) in seen:
+                continue
+            seen.add(id(method))
+            total += int(method.estimate_resident_capacity_bytes())
+        return total
+
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
+        self.unified_gpu_pool = None
+        self.elastic_vram_coordinator = None
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
@@ -417,6 +474,22 @@ class ModelRunnerKVCacheMixin:
                 f"Not enough memory. Please try to increase --mem-fraction-static. "
                 f"Current value: {self.server_args.mem_fraction_static=}"
             )
+
+        if self._should_enable_elastic_vram():
+            self.unified_gpu_pool = get_or_create_unified_gpu_pool(self.device)
+            self.elastic_vram_coordinator = get_or_create_elastic_vram_coordinator(
+                self.device,
+                pool=self.unified_gpu_pool,
+            )
+            kv_budget_bytes = self.max_total_num_tokens * self.get_cell_size_per_token(
+                self.num_effective_layers
+            )
+            expert_budget_bytes = self._estimate_elastic_expert_bytes()
+            self.elastic_vram_coordinator.configure_budget(
+                expert_budget_bytes + kv_budget_bytes
+            )
+            self.elastic_vram_coordinator.register_offloader(get_offloader())
+            self._register_elastic_expert_managers()
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -554,18 +627,35 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
+                if self.elastic_vram_coordinator is not None:
+                    self.token_to_kv_pool = ElasticMLATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        unified_gpu_pool=self.unified_gpu_pool,
+                        elastic_vram_coordinator=self.elastic_vram_coordinator,
+                        initial_size=self.page_size,
+                    )
+                else:
+                    self.token_to_kv_pool = MLATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        kv_lora_rank=self.model_config.kv_lora_rank,
+                        qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
@@ -662,24 +752,47 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
-                    )
+                    if self.elastic_vram_coordinator is not None:
+                        self.token_to_kv_pool = ElasticMHATokenToKVPool(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            enable_alt_stream=not self.server_args.enable_pdmux,
+                            enable_kv_cache_copy=(
+                                self.server_args.speculative_algorithm is not None
+                            ),
+                            unified_gpu_pool=self.unified_gpu_pool,
+                            elastic_vram_coordinator=self.elastic_vram_coordinator,
+                            initial_size=self.page_size,
+                        )
+                    else:
+                        self.token_to_kv_pool = MHATokenToKVPool(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            enable_alt_stream=not self.server_args.enable_pdmux,
+                            enable_kv_cache_copy=(
+                                self.server_args.speculative_algorithm is not None
+                            ),
+                        )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -712,22 +825,25 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
                 else:
+                    allocator_size = self.token_to_kv_pool.size
                     if self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
+                            allocator_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            elastic_vram_coordinator=self.elastic_vram_coordinator,
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
+                            allocator_size,
                             page_size=self.page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            elastic_vram_coordinator=self.elastic_vram_coordinator,
                         )
 
         else:

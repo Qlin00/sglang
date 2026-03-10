@@ -52,6 +52,10 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.mem_cache.elastic_vram import (
+    ElasticVramCoordinator,
+    UnifiedGpuPool,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -1037,6 +1041,163 @@ class MHATokenToKVPool(KVCache):
             )
 
 
+class ElasticMHATokenToKVPool(MHATokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        unified_gpu_pool: UnifiedGpuPool,
+        elastic_vram_coordinator: ElasticVramCoordinator,
+        initial_size: int,
+        **kwargs,
+    ):
+        self.max_size = size
+        self.unified_gpu_pool = unified_gpu_pool
+        self.elastic_vram_coordinator = elastic_vram_coordinator
+        self.k_handles = []
+        self.v_handles = []
+        initial_size = max(page_size, min(size, initial_size))
+        initial_size = max(page_size, initial_size // page_size * page_size)
+        super().__init__(
+            size=initial_size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            **kwargs,
+        )
+        self.elastic_vram_coordinator.register_kv_manager(self)
+
+    def bytes_per_token_capacity(self) -> int:
+        return (
+            self.layer_num
+            * self.head_num
+            * (self.head_dim + self.v_head_dim)
+            * self.store_dtype.itemsize
+        )
+
+    def _free_pool_handles(self):
+        for handle in getattr(self, "k_handles", []):
+            self.unified_gpu_pool.free(handle)
+        for handle in getattr(self, "v_handles", []):
+            self.unified_gpu_pool.free(handle)
+        self.k_handles = []
+        self.v_handles = []
+
+    def _allocate_backing(self, new_size: int):
+        old_k = getattr(self, "k_buffer", None)
+        old_v = getattr(self, "v_buffer", None)
+        old_k_handles = getattr(self, "k_handles", [])
+        old_v_handles = getattr(self, "v_handles", [])
+
+        k_handles = []
+        v_handles = []
+        k_buffer = []
+        v_buffer = []
+
+        for layer_idx in range(self.layer_num):
+            k_shape = (new_size + self.page_size, self.head_num, self.head_dim)
+            v_shape = (new_size + self.page_size, self.head_num, self.v_head_dim)
+            k_handle = self.unified_gpu_pool.alloc(
+                int(np.prod(k_shape) * self.store_dtype.itemsize),
+                tag=f"kv:k:{layer_idx}",
+            )
+            v_handle = self.unified_gpu_pool.alloc(
+                int(np.prod(v_shape) * self.store_dtype.itemsize),
+                tag=f"kv:v:{layer_idx}",
+            )
+            k_view = self.unified_gpu_pool.tensor_view(k_handle, self.store_dtype, k_shape)
+            v_view = self.unified_gpu_pool.tensor_view(v_handle, self.store_dtype, v_shape)
+            k_view.zero_()
+            v_view.zero_()
+            if old_k is not None:
+                keep = min(old_k[layer_idx].shape[0], k_view.shape[0])
+                k_view[:keep].copy_(old_k[layer_idx][:keep])
+                v_view[:keep].copy_(old_v[layer_idx][:keep])
+            k_handles.append(k_handle)
+            v_handles.append(v_handle)
+            k_buffer.append(k_view)
+            v_buffer.append(v_view)
+
+        self.k_handles = k_handles
+        self.v_handles = v_handles
+        self.k_buffer = k_buffer
+        self.v_buffer = v_buffer
+        self.size = new_size
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+        for handle in old_k_handles + old_v_handles:
+            self.unified_gpu_pool.free(handle)
+
+    def _create_buffers(self):
+        self._allocate_backing(self.size)
+
+    def _clear_buffers(self):
+        self._free_pool_handles()
+        if hasattr(self, "k_buffer"):
+            del self.k_buffer
+        if hasattr(self, "v_buffer"):
+            del self.v_buffer
+
+    def capacity_bytes(self) -> int:
+        k_bytes, v_bytes = self.get_kv_size_bytes()
+        return int(k_bytes + v_bytes)
+
+    def ensure_capacity_bytes(self, target_capacity_bytes: int) -> bool:
+        current_bytes = self.capacity_bytes()
+        if target_capacity_bytes <= current_bytes:
+            return True
+        bytes_per_token = self.bytes_per_token_capacity()
+        target_tokens = int(np.ceil(target_capacity_bytes / max(bytes_per_token, 1)))
+        target_tokens = max(self.page_size, target_tokens)
+        target_tokens = (target_tokens + self.page_size - 1) // self.page_size * self.page_size
+        target_tokens = min(self.max_size, target_tokens)
+        if target_tokens <= self.size:
+            return False
+        self._allocate_backing(target_tokens)
+        return True
+
+    def shrink_to_capacity_bytes(self, target_capacity_bytes: int) -> bool:
+        current_bytes = self.capacity_bytes()
+        if target_capacity_bytes >= current_bytes:
+            return False
+        bytes_per_token = self.bytes_per_token_capacity()
+        target_tokens = max(self.page_size, int(target_capacity_bytes // max(bytes_per_token, 1)))
+        target_tokens = target_tokens // self.page_size * self.page_size
+        target_tokens = max(self.page_size, min(self.max_size, target_tokens))
+        if target_tokens >= self.size:
+            return False
+        self._allocate_backing(target_tokens)
+        return True
+
+
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
@@ -1596,6 +1757,128 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+
+class ElasticMLATokenToKVPool(MLATokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        unified_gpu_pool: UnifiedGpuPool,
+        elastic_vram_coordinator: ElasticVramCoordinator,
+        initial_size: int,
+        **kwargs,
+    ):
+        self.max_size = size
+        self.unified_gpu_pool = unified_gpu_pool
+        self.elastic_vram_coordinator = elastic_vram_coordinator
+        self.kv_handles = []
+        initial_size = max(page_size, min(size, initial_size))
+        initial_size = max(page_size, initial_size // page_size * page_size)
+        super().__init__(
+            size=initial_size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            **kwargs,
+        )
+        self.elastic_vram_coordinator.register_kv_manager(self)
+
+    def bytes_per_token_capacity(self) -> int:
+        return self.layer_num * self.kv_cache_dim * self.store_dtype.itemsize
+
+    def _free_pool_handles(self):
+        for handle in getattr(self, "kv_handles", []):
+            self.unified_gpu_pool.free(handle)
+        self.kv_handles = []
+
+    def _allocate_backing(self, new_size: int):
+        old_kv = getattr(self, "kv_buffer", None)
+        old_handles = getattr(self, "kv_handles", [])
+
+        kv_handles = []
+        kv_buffer = []
+
+        for layer_idx in range(self.layer_num):
+            kv_shape = (new_size + self.page_size, 1, self.kv_cache_dim)
+            kv_handle = self.unified_gpu_pool.alloc(
+                int(np.prod(kv_shape) * self.store_dtype.itemsize),
+                tag=f"kv:mla:{layer_idx}",
+            )
+            kv_view = self.unified_gpu_pool.tensor_view(
+                kv_handle, self.store_dtype, kv_shape
+            )
+            kv_view.zero_()
+            if old_kv is not None:
+                keep = min(old_kv[layer_idx].shape[0], kv_view.shape[0])
+                kv_view[:keep].copy_(old_kv[layer_idx][:keep])
+            kv_handles.append(kv_handle)
+            kv_buffer.append(kv_view)
+
+        self.kv_handles = kv_handles
+        self.kv_buffer = kv_buffer
+        self.size = new_size
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+        for handle in old_handles:
+            self.unified_gpu_pool.free(handle)
+
+    def _create_buffers(self):
+        self._allocate_backing(self.size)
+
+    def _clear_buffers(self):
+        self._free_pool_handles()
+        if hasattr(self, "kv_buffer"):
+            del self.kv_buffer
+
+    def capacity_bytes(self) -> int:
+        return int(self.get_kv_size_bytes())
+
+    def ensure_capacity_bytes(self, target_capacity_bytes: int) -> bool:
+        current_bytes = self.capacity_bytes()
+        if target_capacity_bytes <= current_bytes:
+            return True
+        bytes_per_token = self.bytes_per_token_capacity()
+        target_tokens = int(np.ceil(target_capacity_bytes / max(bytes_per_token, 1)))
+        target_tokens = max(self.page_size, target_tokens)
+        target_tokens = (
+            (target_tokens + self.page_size - 1) // self.page_size * self.page_size
+        )
+        target_tokens = min(self.max_size, target_tokens)
+        if target_tokens <= self.size:
+            return False
+        self._allocate_backing(target_tokens)
+        return True
+
+    def shrink_to_capacity_bytes(self, target_capacity_bytes: int) -> bool:
+        current_bytes = self.capacity_bytes()
+        if target_capacity_bytes >= current_bytes:
+            return False
+        bytes_per_token = self.bytes_per_token_capacity()
+        target_tokens = max(
+            self.page_size, int(target_capacity_bytes // max(bytes_per_token, 1))
+        )
+        target_tokens = target_tokens // self.page_size * self.page_size
+        target_tokens = max(self.page_size, min(self.max_size, target_tokens))
+        if target_tokens >= self.size:
+            return False
+        self._allocate_backing(target_tokens)
+        return True
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):

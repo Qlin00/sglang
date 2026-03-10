@@ -115,6 +115,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.elastic_vram import ElasticLayoutStage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -331,6 +332,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.unified_gpu_pool = None
+        self.elastic_vram_coordinator = None
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
@@ -2444,6 +2447,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        if self.elastic_vram_coordinator is not None:
+            if forward_batch.forward_mode.is_decode():
+                self.elastic_vram_coordinator.rebalance_experts(
+                    ElasticLayoutStage.BATCH_BOUNDARY
+                )
+            rebuild_required, rebuild_reasons = (
+                self.elastic_vram_coordinator.consume_graph_rebuild_required()
+            )
+            if rebuild_required:
+                logger.info(
+                    "Elastic VRAM requested graph rebuild: %s",
+                    rebuild_reasons,
+                )
+                self.init_device_graphs()
+                self.init_piecewise_cuda_graphs()
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
